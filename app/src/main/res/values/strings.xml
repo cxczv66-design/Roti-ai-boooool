@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Entity Body</string>
+    <string name="app_subtitle">Remote AI Physical Interface</string>
+    <string name="accessibility_service_label">Entity Body Bridge</string>
+    <string name="accessibility_service_description">Allows Entity Body to read AI chat responses and perform automated text injection and button taps on your behalf when commanded by your connected WebSocket server.</string>
+    <string name="notification_channel_name">Entity Body Link</string>
+    <string name="notification_channel_description">Keeps the WebSocket bridge connected in the background.</string>
+    <string name="notification_title">Entity Body Active</string>
+    <string name="ws_section_title">WebSocket Link</string>
+    <string name="ws_url_label">WebSocket Server URL</string>
+    <string name="ws_url_placeholder">ws://100.x.x.x:8080</string>
+    <string name="btn_connect">Connect</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="btn_connecting">Connecting…</string>
+    <string name="accessibility_section_title">Eyes &amp; Hands Service</string>
+    <string name="btn_start_accessibility">Start Accessibility Service</string>
+    <string name="btn_manage_accessibility">Open Accessibility Settings</string>
+    <string name="btn_read_screen">Read Screen</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_connecting">Connecting</string>
+    <string name="status_disconnected">Disconnected</string>
+    <string name="status_error">Error</string>
+    <string name="accessibility_active">Service Active</string>
+    <string name="accessibility_inactive">Service Disabled</string>
+    <string name="logs_section_title">Telemetry Log</string>
+    <string name="logs_empty_title">No bridge activity yet</string>
+    <string name="logs_empty_subtitle">Enter your WebSocket server URL and enable the Accessibility Service to begin relaying commands.</string>
+    <string name="cd_clear_logs">Clear telemetry logs</string>
+    <string name="cd_clear_url">Clear WebSocket URL</string>
+    <string name="cd_brand_icon">Entity Body emblem</string>
+    <string name="cd_ws_status_icon">WebSocket connection status</string>
+    <string name="cd_accessibility_status_icon">Accessibility service status</string>
+</resources>

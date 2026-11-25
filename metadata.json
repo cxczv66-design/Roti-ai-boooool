@@ -1,0 +1,6 @@
+{
+  "name": "Entity Body",
+  "description": "Android accessibility bridge and WebSocket client acting as the physical interface for a remote AI entity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
