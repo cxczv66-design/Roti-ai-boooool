@@ -1,6 +1,9 @@
 package com.example
 
 import android.accessibilityservice.AccessibilityService
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.graphics.Rect
 import android.os.Bundle
@@ -29,9 +32,10 @@ class EntityAccessibilityService : AccessibilityService() {
 
         private val SEND_ALIASES = listOf(
             "Send",
+            "إرسال",
+            "Enviar",
             "Send message",
             "Send prompt",
-            "إرسال",
             "Submit",
             "Ask"
         )
@@ -42,7 +46,26 @@ class EntityAccessibilityService : AccessibilityService() {
             "Stop response",
             "Stop",
             "إيقاف",
-            "إيقاف التوليد"
+            "إيقاف التوليد",
+            "Detener"
+        )
+
+        private val NON_SEND_DESCRIPTIONS = setOf(
+            "attach",
+            "attachment",
+            "add",
+            "plus",
+            "microphone",
+            "mic",
+            "voice",
+            "dictate",
+            "camera",
+            "gallery",
+            "photo",
+            "image",
+            "clear",
+            "emoji",
+            "menu"
         )
 
         private val COMMON_SEND_VIEW_IDS = listOf(
@@ -62,6 +85,7 @@ class EntityAccessibilityService : AccessibilityService() {
         private val CHROME_TEXT_IGNORE = setOf(
             "send",
             "إرسال",
+            "enviar",
             "stop",
             "stop generating",
             "copy",
@@ -76,6 +100,7 @@ class EntityAccessibilityService : AccessibilityService() {
     private var serviceScope: CoroutineScope? = null
     private var scrapeJob: Job? = null
     private var responseReadyJob: Job? = null
+    private var postSendWaitJob: Job? = null
 
     private var lastScrapedScreenText: String = ""
     private var lastReportedReadyMessage: String = ""
@@ -86,6 +111,9 @@ class EntityAccessibilityService : AccessibilityService() {
 
     @Volatile
     private var awaitingResponse: Boolean = false
+
+    @Volatile
+    private var suppressScrapeUntilMs: Long = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -110,6 +138,7 @@ class EntityAccessibilityService : AccessibilityService() {
     private fun cleanupServiceState() {
         scrapeJob?.cancel()
         responseReadyJob?.cancel()
+        postSendWaitJob?.cancel()
         serviceScope?.cancel()
         serviceScope = null
         instance = null
@@ -118,7 +147,12 @@ class EntityAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
-        val pkg = event.packageName?.toString() ?: return
+        val pkg = try {
+            event.packageName?.toString()
+        } catch (_: Exception) {
+            null
+        } ?: return
+
         if (pkg == packageName || pkg == "com.android.systemui") return
 
         BridgeRepository.setForegroundPackage(pkg)
@@ -140,9 +174,15 @@ class EntityAccessibilityService : AccessibilityService() {
         val scope = serviceScope ?: return
         scrapeJob?.cancel()
         scrapeJob = scope.launch {
-            delay(300L)
-            val root = getActiveRoot() ?: return@launch
-            val pkg = root.packageName?.toString().orEmpty()
+            val remainingSuppress = suppressScrapeUntilMs - System.currentTimeMillis()
+            if (remainingSuppress > 0) {
+                delay(remainingSuppress)
+            } else {
+                delay(300L)
+            }
+
+            val root = safeGetActiveRoot() ?: return@launch
+            val pkg = safePackageName(root)
             if (pkg == packageName || pkg == "com.android.systemui") return@launch
 
             // 1. Screen Scraping (The Eyes) - deduplicated
@@ -162,12 +202,12 @@ class EntityAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // 2. Curiosity Loop Trigger detection
-            evaluateCuriosityLoop(root, pkg)
+            // 2. Auto-Reply / Curiosity Loop detection
+            evaluateResponseReadyLoop(root, pkg)
         }
     }
 
-    private fun evaluateCuriosityLoop(root: AccessibilityNodeInfo, pkg: String) {
+    private fun evaluateResponseReadyLoop(root: AccessibilityNodeInfo, pkg: String) {
         val stopButtonVisible = isStopGeneratingVisible(root)
         val sendNode = findSendButtonNode(root)
         val sendButtonDisabled = sendNode != null && !sendNode.isEnabled
@@ -186,7 +226,7 @@ class EntityAccessibilityService : AccessibilityService() {
             responseReadyJob?.cancel()
             responseReadyJob = scope.launch {
                 delay(550L)
-                val freshRoot = getActiveRoot() ?: return@launch
+                val freshRoot = safeGetActiveRoot() ?: return@launch
                 if (isStopGeneratingVisible(freshRoot)) {
                     wasGenerating = true
                     return@launch
@@ -203,13 +243,13 @@ class EntityAccessibilityService : AccessibilityService() {
                     BridgeRepository.setLastAiMessage(latestMessage)
 
                     val preview = latestMessage.take(70) + if (latestMessage.length > 70) "…" else ""
-                    BridgeRepository.addLog(LogLevel.OK, "Curiosity Loop ready: $preview")
+                    BridgeRepository.addLog(LogLevel.OK, "Auto-Reply ready: $preview")
 
                     if (BridgeRepository.connectionState.value == ConnectionState.CONNECTED) {
                         BridgeRepository.emitOutgoingMessage(
                             BridgeProtocol.responseReadyJson(
                                 lastMessage = latestMessage,
-                                packageName = freshRoot.packageName?.toString() ?: pkg
+                                packageName = safePackageName(freshRoot).ifBlank { pkg }
                             )
                         )
                     }
@@ -218,86 +258,247 @@ class EntityAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun getActiveRoot(): AccessibilityNodeInfo? {
-        rootInActiveWindow?.let { return it }
-        return windows.firstOrNull {
-            it.isActive && it.type == AccessibilityWindowInfo.TYPE_APPLICATION
-        }?.root
+    private fun safeGetActiveRoot(): AccessibilityNodeInfo? {
+        return try {
+            rootInActiveWindow ?: getApplicationWindowRoots().firstOrNull()
+        } catch (_: Exception) {
+            null
+        }
     }
 
-    fun markAwaitingResponse(promptText: String) {
-        lastInjectedPrompt = promptText.trim()
+    private fun getApplicationWindowRoots(): List<AccessibilityNodeInfo> {
+        return try {
+            windows
+                .filter { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
+                .sortedByDescending { it.isActive }
+                .mapNotNull { window ->
+                    try {
+                        window.root
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun safeGetCandidateRoots(): List<AccessibilityNodeInfo> {
+        val list = mutableListOf<AccessibilityNodeInfo>()
+        try {
+            rootInActiveWindow?.let { list.add(it) }
+        } catch (_: Exception) {
+        }
+        for (root in getApplicationWindowRoots()) {
+            if (list.none { it == root }) {
+                list.add(root)
+            }
+        }
+        return list
+    }
+
+    private fun safePackageName(node: AccessibilityNodeInfo?): String {
+        return try {
+            node?.packageName?.toString().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    suspend fun typeAndSend(
+        text: String,
+        sendButtonText: String = "Send"
+    ): AccessibilityActionResult {
+        val typeResult = injectText(text)
+        if (typeResult is AccessibilityActionResult.Error) {
+            return typeResult
+        }
+
+        // Allow the target app's UI to process the injected text and enable the Send button
+        delay(300L)
+
+        val editBounds = findBestEditTextBounds()
+        val clickResult = clickSendOrLastInputNode(
+            preferredLabel = sendButtonText,
+            editBounds = editBounds
+        )
+        if (clickResult is AccessibilityActionResult.Error) {
+            return clickResult
+        }
+
+        // Mark awaiting response and wait 2 seconds before reading the screen so AI starts generating
+        lastInjectedPrompt = text.trim()
         awaitingResponse = true
         wasGenerating = false
+        suppressScrapeUntilMs = System.currentTimeMillis() + 2_000L
+
+        postSendWaitJob?.cancel()
+        postSendWaitJob = serviceScope?.launch {
+            delay(2_000L)
+            val root = safeGetActiveRoot() ?: return@launch
+            val pkg = safePackageName(root)
+            if (pkg != packageName && pkg != "com.android.systemui") {
+                evaluateResponseReadyLoop(root, pkg)
+            }
+        }
+
+        val clickDetail = (clickResult as AccessibilityActionResult.Success).detail
+        return AccessibilityActionResult.Success(
+            detail = "Typed ${text.length} chars & $clickDetail",
+            packageName = clickResult.packageName
+        )
     }
 
-    fun injectText(text: String, targetViewId: String? = null): AccessibilityActionResult {
-        val root = getActiveRoot()
-            ?: return AccessibilityActionResult.Error("No active window root available")
-
-        var targetNode: AccessibilityNodeInfo? = null
-
-        if (!targetViewId.isNullOrBlank()) {
-            targetNode = root.findAccessibilityNodeInfosByViewId(targetViewId)
-                ?.firstOrNull { it.isVisibleToUser && it.isEnabled }
+    suspend fun injectText(
+        text: String,
+        targetViewId: String? = null
+    ): AccessibilityActionResult {
+        val roots = safeGetCandidateRoots()
+        if (roots.isEmpty()) {
+            return AccessibilityActionResult.Error("No active window root available (rootInActiveWindow is null)")
         }
 
-        if (targetNode == null) {
-            val editNodes = collectNodes(root) { node ->
-                val cls = node.className?.toString()
-                node.isVisibleToUser && (cls == "android.widget.EditText" || node.isEditable)
-            }
-
-            targetNode = editNodes.firstOrNull {
-                it.className?.toString() == "android.widget.EditText" && it.isFocused
-            } ?: editNodes.firstOrNull {
-                it.className?.toString() == "android.widget.EditText"
-            } ?: editNodes.firstOrNull {
-                it.isFocused && it.isEditable
-            } ?: editNodes.firstOrNull {
-                it.isEditable
-            }
-        }
-
-        if (targetNode == null) {
-            return AccessibilityActionResult.Error(
-                "No EditText or editable input field found on screen (${root.packageName ?: "unknown"})"
+        val targetNode = findBestEditTextNode(roots, targetViewId)
+            ?: return AccessibilityActionResult.Error(
+                "No EditText or editable input field found on screen (${safePackageName(roots.firstOrNull())})"
             )
-        }
 
-        targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        if (!targetNode.isFocused) {
-            targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        val pkg = safePackageName(targetNode).ifBlank { safePackageName(roots.firstOrNull()) }
+
+        // Attempt 1: Focus + ACTION_SET_TEXT directly
+        try {
+            targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        } catch (_: Exception) {
         }
 
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
-        val setSuccess = targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-
-        return if (setSuccess) {
-            val pkg = root.packageName?.toString().orEmpty()
-            AccessibilityActionResult.Success(
-                detail = "Injected ${text.length} chars into input field",
+        val firstTry = try {
+            targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        } catch (_: Exception) {
+            false
+        }
+        if (firstTry) {
+            return AccessibilityActionResult.Success(
+                detail = "Injected ${text.length} chars via ACTION_SET_TEXT",
                 packageName = pkg
             )
-        } else {
-            AccessibilityActionResult.Error("Found EditText but ACTION_SET_TEXT was rejected")
+        }
+
+        // Attempt 2: Click to activate composer, then retry ACTION_SET_TEXT
+        try {
+            targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        } catch (_: Exception) {
+        }
+        delay(120L)
+
+        val refreshedNode = findBestEditTextNode(safeGetCandidateRoots(), targetViewId) ?: targetNode
+        val secondTry = try {
+            refreshedNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        } catch (_: Exception) {
+            false
+        }
+        if (secondTry) {
+            return AccessibilityActionResult.Success(
+                detail = "Injected ${text.length} chars via click + ACTION_SET_TEXT",
+                packageName = pkg
+            )
+        }
+
+        // Attempt 3: Clipboard + ACTION_PASTE fallback for custom WebViews/composers
+        val pasted = try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            clipboard?.setPrimaryClip(ClipData.newPlainText("entity_body_input", text))
+            refreshedNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        } catch (_: Exception) {
+            false
+        }
+        if (pasted) {
+            return AccessibilityActionResult.Success(
+                detail = "Injected ${text.length} chars via ACTION_PASTE fallback",
+                packageName = pkg
+            )
+        }
+
+        return AccessibilityActionResult.Error("Found EditText ($pkg) but ACTION_SET_TEXT was rejected")
+    }
+
+    private fun findBestEditTextNode(
+        roots: List<AccessibilityNodeInfo>,
+        targetViewId: String?
+    ): AccessibilityNodeInfo? {
+        for (root in roots) {
+            if (!targetViewId.isNullOrBlank()) {
+                val byId = try {
+                    root.findAccessibilityNodeInfosByViewId(targetViewId)
+                } catch (_: Exception) {
+                    null
+                }
+                val match = byId?.firstOrNull { it.isEnabled }
+                if (match != null) return match
+            }
+        }
+
+        val allEditCandidates = mutableListOf<AccessibilityNodeInfo>()
+        for (root in roots) {
+            val pkg = safePackageName(root)
+            if (pkg == packageName || pkg == "com.android.systemui") continue
+
+            allEditCandidates += collectNodes(root) { node ->
+                val cls = node.className?.toString().orEmpty()
+                cls.equals("android.widget.EditText", ignoreCase = true) ||
+                    cls.contains("EditText", ignoreCase = true) ||
+                    node.isEditable
+            }
+        }
+
+        if (allEditCandidates.isEmpty()) return null
+
+        return allEditCandidates.firstOrNull {
+            it.isVisibleToUser && it.isEnabled && it.isFocused &&
+                it.className?.toString()?.contains("EditText", ignoreCase = true) == true
+        } ?: allEditCandidates.firstOrNull {
+            it.isVisibleToUser && it.isEnabled &&
+                it.className?.toString()?.contains("EditText", ignoreCase = true) == true
+        } ?: allEditCandidates.firstOrNull {
+            it.isVisibleToUser && it.isEnabled && it.isEditable
+        } ?: allEditCandidates.firstOrNull {
+            it.className?.toString()?.contains("EditText", ignoreCase = true) == true
+        } ?: allEditCandidates.firstOrNull()
+    }
+
+    private fun findBestEditTextBounds(): Rect? {
+        val node = findBestEditTextNode(safeGetCandidateRoots(), null) ?: return null
+        val rect = Rect()
+        return try {
+            node.getBoundsInScreen(rect)
+            rect
+        } catch (_: Exception) {
+            null
         }
     }
 
     fun clickElement(text: String?, viewId: String? = null): AccessibilityActionResult {
-        val root = getActiveRoot()
-            ?: return AccessibilityActionResult.Error("No active window root available")
+        val roots = safeGetCandidateRoots()
+        val root = roots.firstOrNull()
+            ?: return AccessibilityActionResult.Error("No active window root available (rootInActiveWindow is null)")
 
         if (!viewId.isNullOrBlank()) {
-            val byId = root.findAccessibilityNodeInfosByViewId(viewId)
-            val clickable = byId?.firstNotNullOfOrNull { findClickableSelfOrParent(it) }
-            if (clickable != null && clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                return AccessibilityActionResult.Success(
-                    detail = "Clicked element by ID '$viewId'",
-                    packageName = root.packageName?.toString().orEmpty()
-                )
+            for (r in roots) {
+                val byId = try {
+                    r.findAccessibilityNodeInfosByViewId(viewId)
+                } catch (_: Exception) {
+                    null
+                }
+                val clickable = byId?.firstNotNullOfOrNull { findClickableSelfOrParent(it) }
+                if (clickable != null && safePerformClick(clickable)) {
+                    return AccessibilityActionResult.Success(
+                        detail = "Clicked element by ID '$viewId'",
+                        packageName = safePackageName(r)
+                    )
+                }
             }
         }
 
@@ -309,72 +510,85 @@ class EntityAccessibilityService : AccessibilityService() {
                 listOf(text.trim())
             }
 
-            // 1. Standard findAccessibilityNodeInfosByText
-            for (candidate in candidates) {
-                val matched = root.findAccessibilityNodeInfosByText(candidate)
-                if (!matched.isNullOrEmpty()) {
-                    val exactClickable = matched.firstOrNull { node ->
-                        node.isVisibleToUser &&
-                            (node.text?.toString()?.equals(candidate, ignoreCase = true) == true ||
-                                node.contentDescription?.toString()?.equals(candidate, ignoreCase = true) == true)
-                    }?.let { findClickableSelfOrParent(it) }
+            for (r in roots) {
+                val pkg = safePackageName(r)
+                if (pkg == packageName || pkg == "com.android.systemui") continue
 
-                    val target = exactClickable ?: matched.firstOrNull { it.isVisibleToUser }
-                        ?.let { findClickableSelfOrParent(it) }
+                // 1. Standard findAccessibilityNodeInfosByText
+                for (candidate in candidates) {
+                    val matched = try {
+                        r.findAccessibilityNodeInfosByText(candidate)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (!matched.isNullOrEmpty()) {
+                        val exactClickable = matched.firstOrNull { node ->
+                            node.isVisibleToUser &&
+                                (node.text?.toString()?.equals(candidate, ignoreCase = true) == true ||
+                                    node.contentDescription?.toString()?.equals(candidate, ignoreCase = true) == true)
+                        }?.let { findClickableSelfOrParent(it) }
 
-                    if (target != null && target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                        if (isSendQuery) awaitingResponse = true
-                        return AccessibilityActionResult.Success(
-                            detail = "Clicked '$candidate' via text search",
-                            packageName = root.packageName?.toString().orEmpty()
-                        )
+                        val target = exactClickable ?: matched.firstOrNull { it.isVisibleToUser }
+                            ?.let { findClickableSelfOrParent(it) }
+
+                        if (target != null && safePerformClick(target)) {
+                            if (isSendQuery) awaitingResponse = true
+                            return AccessibilityActionResult.Success(
+                                detail = "Clicked '$candidate' via text search",
+                                packageName = pkg
+                            )
+                        }
                     }
                 }
-            }
 
-            // 2. Recursive traversal checking exact text and contentDescription
-            val exactDescMatch = collectNodes(root) { node ->
-                node.isVisibleToUser && candidates.any { candidate ->
-                    node.contentDescription?.toString()?.trim()?.equals(candidate, ignoreCase = true) == true ||
-                        node.text?.toString()?.trim()?.equals(candidate, ignoreCase = true) == true
+                // 2. Recursive exact match on text or contentDescription
+                val exactDescMatch = collectNodes(r) { node ->
+                    node.isVisibleToUser && candidates.any { candidate ->
+                        node.contentDescription?.toString()?.trim()?.equals(candidate, ignoreCase = true) == true ||
+                            node.text?.toString()?.trim()?.equals(candidate, ignoreCase = true) == true
+                    }
+                }.firstNotNullOfOrNull { findClickableSelfOrParent(it) }
+
+                if (exactDescMatch != null && safePerformClick(exactDescMatch)) {
+                    if (isSendQuery) awaitingResponse = true
+                    return AccessibilityActionResult.Success(
+                        detail = "Clicked '$text' via contentDescription/text match",
+                        packageName = pkg
+                    )
                 }
-            }.firstNotNullOfOrNull { findClickableSelfOrParent(it) }
 
-            if (exactDescMatch != null && exactDescMatch.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                if (isSendQuery) awaitingResponse = true
-                return AccessibilityActionResult.Success(
-                    detail = "Clicked '$text' via contentDescription/text match",
-                    packageName = root.packageName?.toString().orEmpty()
-                )
-            }
+                // 3. Recursive partial match on text or contentDescription
+                val partialDescMatch = collectNodes(r) { node ->
+                    node.isVisibleToUser && candidates.any { candidate ->
+                        node.contentDescription?.toString()?.contains(candidate, ignoreCase = true) == true ||
+                            node.text?.toString()?.contains(candidate, ignoreCase = true) == true
+                    }
+                }.firstNotNullOfOrNull { findClickableSelfOrParent(it) }
 
-            // 3. Partial match
-            val partialDescMatch = collectNodes(root) { node ->
-                node.isVisibleToUser && candidates.any { candidate ->
-                    node.contentDescription?.toString()?.contains(candidate, ignoreCase = true) == true ||
-                        node.text?.toString()?.contains(candidate, ignoreCase = true) == true
+                if (partialDescMatch != null && safePerformClick(partialDescMatch)) {
+                    if (isSendQuery) awaitingResponse = true
+                    return AccessibilityActionResult.Success(
+                        detail = "Clicked '$text' via partial match",
+                        packageName = pkg
+                    )
                 }
-            }.firstNotNullOfOrNull { findClickableSelfOrParent(it) }
 
-            if (partialDescMatch != null && partialDescMatch.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                if (isSendQuery) awaitingResponse = true
-                return AccessibilityActionResult.Success(
-                    detail = "Clicked '$text' via partial match",
-                    packageName = root.packageName?.toString().orEmpty()
-                )
-            }
-
-            // 4. Fallback common Send button view IDs
-            if (isSendQuery) {
-                for (commonId in COMMON_SEND_VIEW_IDS) {
-                    val byCommonId = root.findAccessibilityNodeInfosByViewId(commonId)
-                    val clickable = byCommonId?.firstNotNullOfOrNull { findClickableSelfOrParent(it) }
-                    if (clickable != null && clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                        awaitingResponse = true
-                        return AccessibilityActionResult.Success(
-                            detail = "Clicked Send via common ID '$commonId'",
-                            packageName = root.packageName?.toString().orEmpty()
-                        )
+                // 4. Common Send view IDs
+                if (isSendQuery) {
+                    for (commonId in COMMON_SEND_VIEW_IDS) {
+                        val byCommonId = try {
+                            r.findAccessibilityNodeInfosByViewId(commonId)
+                        } catch (_: Exception) {
+                            null
+                        }
+                        val clickable = byCommonId?.firstNotNullOfOrNull { findClickableSelfOrParent(it) }
+                        if (clickable != null && safePerformClick(clickable)) {
+                            awaitingResponse = true
+                            return AccessibilityActionResult.Success(
+                                detail = "Clicked Send via common ID '$commonId'",
+                                packageName = pkg
+                            )
+                        }
                     }
                 }
             }
@@ -385,11 +599,118 @@ class EntityAccessibilityService : AccessibilityService() {
         )
     }
 
-    fun readLastAiMessage(): AccessibilityActionResult {
-        val root = getActiveRoot()
-            ?: return AccessibilityActionResult.Error("No active window root available")
+    private fun clickSendOrLastInputNode(
+        preferredLabel: String,
+        editBounds: Rect?
+    ): AccessibilityActionResult {
+        // First try explicit Send text / Arabic / Spanish / contentDescription / common IDs
+        val directResult = clickElement(text = preferredLabel)
+        if (directResult is AccessibilityActionResult.Success) {
+            return directResult
+        }
 
-        val pkg = root.packageName?.toString().orEmpty()
+        // Fallback: click the last clickable enabled node in the input area
+        val roots = safeGetCandidateRoots()
+        for (root in roots) {
+            val pkg = safePackageName(root)
+            if (pkg == packageName || pkg == "com.android.systemui") continue
+
+            val editNode = findBestEditTextNode(listOf(root), null)
+            val resolvedEditBounds = editBounds ?: editNode?.let {
+                val r = Rect()
+                try {
+                    it.getBoundsInScreen(r)
+                    r
+                } catch (_: Exception) {
+                    null
+                }
+            }
+
+            // Try walking up 1..3 levels from EditText to inspect its input container
+            if (editNode != null) {
+                var container: AccessibilityNodeInfo? = editNode.parent
+                var depth = 0
+                while (container != null && depth < 3) {
+                    val clickablesInContainer = collectNodes(container) { node ->
+                        isCandidateInputAreaButton(node, editNode, resolvedEditBounds)
+                    }
+                    val lastClickable = clickablesInContainer.lastOrNull()
+                    if (lastClickable != null && safePerformClick(lastClickable)) {
+                        return AccessibilityActionResult.Success(
+                            detail = "Clicked last clickable node in input container",
+                            packageName = pkg
+                        )
+                    }
+                    container = container.parent
+                    depth++
+                }
+            }
+
+            // Wider fallback: any clickable node sharing the EditText's horizontal band on screen
+            if (resolvedEditBounds != null) {
+                val bandClickables = collectNodes(root) { node ->
+                    if (!isCandidateInputAreaButton(node, editNode, resolvedEditBounds)) {
+                        return@collectNodes false
+                    }
+                    val r = Rect()
+                    try {
+                        node.getBoundsInScreen(r)
+                        val verticalOverlap = r.bottom >= (resolvedEditBounds.top - 120) &&
+                            r.top <= (resolvedEditBounds.bottom + 120)
+                        verticalOverlap
+                    } catch (_: Exception) {
+                        false
+                    }
+                }
+                val lastInBand = bandClickables.lastOrNull()
+                if (lastInBand != null && safePerformClick(lastInBand)) {
+                    return AccessibilityActionResult.Success(
+                        detail = "Clicked last clickable node in input band",
+                        packageName = pkg
+                    )
+                }
+            }
+        }
+
+        return AccessibilityActionResult.Error(
+            "Send button ('Send', 'إرسال', 'Enviar') and fallback input-area button were not found"
+        )
+    }
+
+    private fun isCandidateInputAreaButton(
+        node: AccessibilityNodeInfo,
+        editNode: AccessibilityNodeInfo?,
+        editBounds: Rect?
+    ): Boolean {
+        if (!node.isVisibleToUser || !node.isClickable || !node.isEnabled) return false
+        if (editNode != null && node == editNode) return false
+
+        val cls = node.className?.toString().orEmpty()
+        if (cls.contains("EditText", ignoreCase = true) || node.isEditable) return false
+
+        val desc = node.contentDescription?.toString()?.trim()?.lowercase().orEmpty()
+        val txt = node.text?.toString()?.trim()?.lowercase().orEmpty()
+        if (desc in NON_SEND_DESCRIPTIONS || txt in NON_SEND_DESCRIPTIONS) return false
+
+        // If node wraps the EditText itself (parent container), exclude it
+        if (editBounds != null) {
+            val r = Rect()
+            try {
+                node.getBoundsInScreen(r)
+                if (r.contains(editBounds) && r.width() > editBounds.width() + 20) {
+                    return false
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return true
+    }
+
+    fun readLastAiMessage(): AccessibilityActionResult {
+        val root = safeGetActiveRoot()
+            ?: return AccessibilityActionResult.Error("No active window root available (rootInActiveWindow is null)")
+
+        val pkg = safePackageName(root)
         val lastMessage = extractLastAiMessageText(root)
         return if (!lastMessage.isNullOrBlank()) {
             BridgeRepository.setLastAiMessage(lastMessage)
@@ -400,14 +721,18 @@ class EntityAccessibilityService : AccessibilityService() {
     }
 
     fun scrollChat(forward: Boolean): AccessibilityActionResult {
-        val root = getActiveRoot()
-            ?: return AccessibilityActionResult.Error("No active window root available")
+        val root = safeGetActiveRoot()
+            ?: return AccessibilityActionResult.Error("No active window root available (rootInActiveWindow is null)")
 
         val scrollable = collectNodes(root) { it.isVisibleToUser && it.isScrollable }
             .maxByOrNull { node ->
                 val rect = Rect()
-                node.getBoundsInScreen(rect)
-                rect.width().toLong() * rect.height().toLong()
+                try {
+                    node.getBoundsInScreen(rect)
+                    rect.width().toLong() * rect.height().toLong()
+                } catch (_: Exception) {
+                    0L
+                }
             }
             ?: return AccessibilityActionResult.Error("No scrollable view found on current screen")
 
@@ -416,11 +741,15 @@ class EntityAccessibilityService : AccessibilityService() {
         } else {
             AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
         }
-        val ok = scrollable.performAction(action)
+        val ok = try {
+            scrollable.performAction(action)
+        } catch (_: Exception) {
+            false
+        }
         return if (ok) {
             AccessibilityActionResult.Success(
                 detail = if (forward) "Scrolled forward" else "Scrolled backward",
-                packageName = root.packageName?.toString().orEmpty()
+                packageName = safePackageName(root)
             )
         } else {
             AccessibilityActionResult.Error("Scroll action could not be performed")
@@ -428,7 +757,11 @@ class EntityAccessibilityService : AccessibilityService() {
     }
 
     fun performBack(): AccessibilityActionResult {
-        val ok = performGlobalAction(GLOBAL_ACTION_BACK)
+        val ok = try {
+            performGlobalAction(GLOBAL_ACTION_BACK)
+        } catch (_: Exception) {
+            false
+        }
         return if (ok) {
             AccessibilityActionResult.Success("Performed global BACK")
         } else {
@@ -437,7 +770,11 @@ class EntityAccessibilityService : AccessibilityService() {
     }
 
     fun performHome(): AccessibilityActionResult {
-        val ok = performGlobalAction(GLOBAL_ACTION_HOME)
+        val ok = try {
+            performGlobalAction(GLOBAL_ACTION_HOME)
+        } catch (_: Exception) {
+            false
+        }
         return if (ok) {
             AccessibilityActionResult.Success("Performed global HOME")
         } else {
@@ -445,9 +782,21 @@ class EntityAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun safePerformClick(node: AccessibilityNodeInfo): Boolean {
+        return try {
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun isStopGeneratingVisible(root: AccessibilityNodeInfo): Boolean {
         for (stopId in COMMON_STOP_VIEW_IDS) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(stopId)
+            val nodes = try {
+                root.findAccessibilityNodeInfosByViewId(stopId)
+            } catch (_: Exception) {
+                null
+            }
             if (!nodes.isNullOrEmpty() && nodes.any { it.isVisibleToUser }) {
                 return true
             }
@@ -467,7 +816,11 @@ class EntityAccessibilityService : AccessibilityService() {
 
     private fun findSendButtonNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         for (sendId in COMMON_SEND_VIEW_IDS) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(sendId)
+            val nodes = try {
+                root.findAccessibilityNodeInfosByViewId(sendId)
+            } catch (_: Exception) {
+                null
+            }
             val visible = nodes?.firstOrNull { it.isVisibleToUser }
             if (visible != null) return visible
         }
@@ -486,13 +839,16 @@ class EntityAccessibilityService : AccessibilityService() {
         val seen = LinkedHashSet<String>()
 
         fun walk(node: AccessibilityNodeInfo) {
-            if (!node.isVisibleToUser) return
-            val rawText = node.text?.toString()?.trim()
-            if (!rawText.isNullOrEmpty() && seen.add(rawText)) {
-                collected.add(rawText)
-            }
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { walk(it) }
+            try {
+                if (!node.isVisibleToUser) return
+                val rawText = node.text?.toString()?.trim()
+                if (!rawText.isNullOrEmpty() && seen.add(rawText)) {
+                    collected.add(rawText)
+                }
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { walk(it) }
+                }
+            } catch (_: Exception) {
             }
         }
 
@@ -503,11 +859,15 @@ class EntityAccessibilityService : AccessibilityService() {
     private fun extractLastAiMessageText(root: AccessibilityNodeInfo): String? {
         val inputTopY = collectNodes(root) { node ->
             node.isVisibleToUser &&
-                (node.className?.toString() == "android.widget.EditText" || node.isEditable)
+                (node.className?.toString()?.contains("EditText", ignoreCase = true) == true || node.isEditable)
         }.minOfOrNull { node ->
             val rect = Rect()
-            node.getBoundsInScreen(rect)
-            rect.top
+            try {
+                node.getBoundsInScreen(rect)
+                rect.top
+            } catch (_: Exception) {
+                Int.MAX_VALUE
+            }
         } ?: Int.MAX_VALUE
 
         val scrollableContainers = collectNodes(root) { node ->
@@ -523,17 +883,29 @@ class EntityAccessibilityService : AccessibilityService() {
 
         val primaryChatContainer = scrollableContainers.maxByOrNull { node ->
             val rect = Rect()
-            node.getBoundsInScreen(rect)
-            rect.width().toLong() * rect.height().toLong()
+            try {
+                node.getBoundsInScreen(rect)
+                rect.width().toLong() * rect.height().toLong()
+            } catch (_: Exception) {
+                0L
+            }
         }
 
         if (primaryChatContainer != null && primaryChatContainer.childCount > 0) {
             val childMessages = mutableListOf<String>()
             for (i in 0 until primaryChatContainer.childCount) {
-                val child = primaryChatContainer.getChild(i) ?: continue
+                val child = try {
+                    primaryChatContainer.getChild(i)
+                } catch (_: Exception) {
+                    null
+                } ?: continue
                 val childRect = Rect()
-                child.getBoundsInScreen(childRect)
-                if (!child.isVisibleToUser || childRect.top >= inputTopY) continue
+                try {
+                    child.getBoundsInScreen(childRect)
+                    if (!child.isVisibleToUser || childRect.top >= inputTopY) continue
+                } catch (_: Exception) {
+                    continue
+                }
 
                 val childTexts = extractMeaningfulTexts(child, inputTopY)
                 if (childTexts.isNotEmpty()) {
@@ -556,22 +928,26 @@ class EntityAccessibilityService : AccessibilityService() {
         val seen = LinkedHashSet<String>()
 
         fun walk(node: AccessibilityNodeInfo) {
-            if (!node.isVisibleToUser) return
-            if (node.isEditable || node.className?.toString() == "android.widget.EditText") return
+            try {
+                if (!node.isVisibleToUser) return
+                val cls = node.className?.toString().orEmpty()
+                if (node.isEditable || cls.contains("EditText", ignoreCase = true)) return
 
-            val rect = Rect()
-            node.getBoundsInScreen(rect)
-            if (rect.top >= maxBottomY) return
+                val rect = Rect()
+                node.getBoundsInScreen(rect)
+                if (rect.top >= maxBottomY) return
 
-            val rawText = node.text?.toString()?.trim()
-            if (!rawText.isNullOrEmpty() && isMeaningfulChatText(rawText)) {
-                if (seen.add(rawText)) {
-                    collected.add(rawText)
+                val rawText = node.text?.toString()?.trim()
+                if (!rawText.isNullOrEmpty() && isMeaningfulChatText(rawText)) {
+                    if (seen.add(rawText)) {
+                        collected.add(rawText)
+                    }
                 }
-            }
 
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { walk(it) }
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { walk(it) }
+                }
+            } catch (_: Exception) {
             }
         }
 
@@ -593,10 +969,14 @@ class EntityAccessibilityService : AccessibilityService() {
         var current: AccessibilityNodeInfo? = node
         var depth = 0
         while (current != null && depth < 5) {
-            if (current.isClickable && current.isEnabled) {
-                return current
+            try {
+                if (current.isClickable && current.isEnabled) {
+                    return current
+                }
+                current = current.parent
+            } catch (_: Exception) {
+                return null
             }
-            current = current.parent
             depth++
         }
         return null
@@ -611,11 +991,14 @@ class EntityAccessibilityService : AccessibilityService() {
         stack.addLast(root)
         while (stack.isNotEmpty()) {
             val current = stack.removeLast()
-            if (predicate(current)) {
-                results.add(current)
-            }
-            for (i in current.childCount - 1 downTo 0) {
-                current.getChild(i)?.let { stack.addLast(it) }
+            try {
+                if (predicate(current)) {
+                    results.add(current)
+                }
+                for (i in current.childCount - 1 downTo 0) {
+                    current.getChild(i)?.let { stack.addLast(it) }
+                }
+            } catch (_: Exception) {
             }
         }
         return results

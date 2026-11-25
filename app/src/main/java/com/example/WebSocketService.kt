@@ -24,6 +24,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
@@ -234,6 +235,38 @@ class WebSocketService : Service() {
 
     private fun handleIncomingMessage(webSocket: WebSocket, rawText: String) {
         serviceScope.launch {
+            val json = try {
+                JSONObject(rawText)
+            } catch (e: Exception) {
+                val errMsg = "Invalid JSON payload: ${e.message}"
+                BridgeRepository.addLog(LogLevel.ERR, errMsg)
+                webSocket.send(BridgeProtocol.actionResultJson("parse", false, errMsg))
+                return@launch
+            }
+
+            val rawAction = json.optString("action", "").trim().lowercase()
+            if (rawAction == "type_and_send" || rawAction == "send_prompt" || rawAction == "ask") {
+                val text = json.optString("text", "")
+                val sendButtonText = json.optString("send_text", "Send").ifBlank { "Send" }
+                if (text.isBlank()) {
+                    val errMsg = "Missing 'text' field for '$rawAction'"
+                    BridgeRepository.addLog(LogLevel.ERR, errMsg)
+                    webSocket.send(BridgeProtocol.actionResultJson(rawAction, false, errMsg))
+                    return@launch
+                }
+
+                val service = EntityAccessibilityService.instance
+                if (service == null) {
+                    sendMissingServiceError(webSocket, rawAction)
+                    return@launch
+                }
+                val result = withContext(Dispatchers.Main) {
+                    service.typeAndSend(text = text, sendButtonText = sendButtonText)
+                }
+                sendActionResult(webSocket, rawAction, result)
+                return@launch
+            }
+
             val parsed = BridgeProtocol.parseCommand(rawText)
             if (parsed.isFailure) {
                 val errMsg = parsed.exceptionOrNull()?.message ?: "Invalid JSON command"
@@ -288,19 +321,10 @@ class WebSocketService : Service() {
                         sendMissingServiceError(webSocket, "type_and_send")
                         return@launch
                     }
-                    val typeResult = withContext(Dispatchers.Main) {
-                        service.markAwaitingResponse(cmd.text)
-                        service.injectText(cmd.text)
+                    val result = withContext(Dispatchers.Main) {
+                        service.typeAndSend(cmd.text, cmd.sendButtonText)
                     }
-                    if (typeResult is AccessibilityActionResult.Error) {
-                        sendActionResult(webSocket, "type_and_send", typeResult)
-                        return@launch
-                    }
-                    delay(250)
-                    val clickResult = withContext(Dispatchers.Main) {
-                        service.clickElement(cmd.sendButtonText)
-                    }
-                    sendActionResult(webSocket, "type_and_send", clickResult)
+                    sendActionResult(webSocket, "type_and_send", result)
                 }
 
                 is BridgeCommand.ReadLastMessage -> {
