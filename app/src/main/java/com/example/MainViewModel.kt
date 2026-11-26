@@ -16,6 +16,8 @@ data class MainUiState(
     val wsUrlInput: String = "",
     val connectionState: ConnectionState = ConnectionState.DISCONNECTED,
     val accessibilityEnabled: Boolean = false,
+    val shizukuStatus: ShizukuStatus = ShizukuStatus.UNAVAILABLE,
+    val targetAiPackage: String = "com.openai.chatgpt",
     val foregroundPackage: String? = null,
     val lastAiMessage: String? = null,
     val logs: List<TelemetryLogEntry> = emptyList()
@@ -31,6 +33,8 @@ class MainViewModel : ViewModel() {
         BridgeRepository.connectionState,
         BridgeRepository.accessibilityActive,
         _systemAccessibilityEnabled,
+        BridgeRepository.shizukuStatus,
+        BridgeRepository.targetAiPackage,
         BridgeRepository.foregroundPackage,
         BridgeRepository.lastAiMessage,
         BridgeRepository.logs
@@ -39,15 +43,19 @@ class MainViewModel : ViewModel() {
         val connState = values[1] as ConnectionState
         val serviceActive = values[2] as Boolean
         val sysEnabled = values[3] as Boolean
-        val fgPkg = values[4] as String?
-        val lastMsg = values[5] as String?
+        val shizuku = values[4] as ShizukuStatus
+        val targetPkg = values[5] as String
+        val fgPkg = values[6] as String?
+        val lastMsg = values[7] as String?
         @Suppress("UNCHECKED_CAST")
-        val logList = values[6] as List<TelemetryLogEntry>
+        val logList = values[8] as List<TelemetryLogEntry>
 
         MainUiState(
             wsUrlInput = urlInput,
             connectionState = connState,
             accessibilityEnabled = serviceActive || sysEnabled,
+            shizukuStatus = shizuku,
+            targetAiPackage = targetPkg,
             foregroundPackage = fgPkg,
             lastAiMessage = lastMsg,
             logs = logList
@@ -58,13 +66,29 @@ class MainViewModel : ViewModel() {
         initialValue = MainUiState()
     )
 
+    fun initialize(context: Context) {
+        BridgeRepository.loadPreferences(context)
+        ShizukuController.init(context)
+        refreshAccessibilityStatus(context)
+    }
+
     fun onWsUrlChanged(newValue: String) {
         _wsUrlInput.value = newValue
+    }
+
+    fun selectTargetAiApp(context: Context, packageName: String) {
+        BridgeRepository.setTargetAiPackage(context, packageName)
+        BridgeRepository.addLog(LogLevel.INFO, "Target AI app set to $packageName")
+    }
+
+    fun requestShizukuAuthorization() {
+        ShizukuController.requestPermission()
     }
 
     fun refreshAccessibilityStatus(context: Context) {
         val enabledInSystem = isAccessibilityServiceEnabled(context)
         _systemAccessibilityEnabled.value = enabledInSystem
+        ShizukuController.refreshStatus()
     }
 
     fun readCurrentScreenNow() {
@@ -80,7 +104,7 @@ class MainViewModel : ViewModel() {
             is AccessibilityActionResult.Success -> {
                 BridgeRepository.addLog(
                     LogLevel.OK,
-                    "Read screen (${result.packageName}): ${result.detail.take(120)}"
+                    "Read clean bubble (${result.packageName}): ${result.detail.take(120)}"
                 )
                 if (BridgeRepository.connectionState.value == ConnectionState.CONNECTED) {
                     BridgeRepository.emitOutgoingMessage(

@@ -33,6 +33,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -53,17 +54,20 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccessibilityNew
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Visibility
@@ -72,6 +76,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -140,19 +146,22 @@ fun EntityBodyScreen(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val gradients = LocalGradientPalette.current
 
-    // Staggered entrance animation states
     var showHeader by remember { mutableStateOf(false) }
     var showWsCard by remember { mutableStateOf(false) }
     var showAccCard by remember { mutableStateOf(false) }
+    var showTargetCard by remember { mutableStateOf(false) }
     var showLogsCard by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
+        viewModel.initialize(context)
         showHeader = true
-        delay(55)
+        delay(50)
         showWsCard = true
-        delay(55)
+        delay(50)
         showAccCard = true
-        delay(55)
+        delay(50)
+        showTargetCard = true
+        delay(50)
         showLogsCard = true
     }
 
@@ -220,7 +229,6 @@ fun EntityBodyScreen(
         context.startActivity(intent)
     }
 
-    // Subtle ambient dual-tone gradient drift
     val ambientTransition = rememberInfiniteTransition(label = "ambient_glow")
     val driftProgress by ambientTransition.animateFloat(
         initialValue = 0f,
@@ -272,12 +280,12 @@ fun EntityBodyScreen(
                     .align(Alignment.TopCenter)
                     .widthIn(max = 640.dp)
                     .fillMaxSize()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 AnimatedVisibility(
                     visible = showHeader,
-                    enter = fadeIn(tween(260)) + slideInVertically(
+                    enter = fadeIn(tween(240)) + slideInVertically(
                         animationSpec = spring(
                             dampingRatio = Spring.DampingRatioLowBouncy,
                             stiffness = Spring.StiffnessMediumLow
@@ -287,13 +295,14 @@ fun EntityBodyScreen(
                 ) {
                     HeaderSection(
                         connectionState = uiState.connectionState,
-                        accessibilityEnabled = uiState.accessibilityEnabled
+                        accessibilityEnabled = uiState.accessibilityEnabled,
+                        shizukuStatus = uiState.shizukuStatus
                     )
                 }
 
                 AnimatedVisibility(
                     visible = showWsCard,
-                    enter = fadeIn(tween(260)) + slideInVertically(
+                    enter = fadeIn(tween(240)) + slideInVertically(
                         animationSpec = spring(
                             dampingRatio = Spring.DampingRatioLowBouncy,
                             stiffness = Spring.StiffnessMediumLow
@@ -311,7 +320,7 @@ fun EntityBodyScreen(
 
                 AnimatedVisibility(
                     visible = showAccCard,
-                    enter = fadeIn(tween(260)) + slideInVertically(
+                    enter = fadeIn(tween(240)) + slideInVertically(
                         animationSpec = spring(
                             dampingRatio = Spring.DampingRatioLowBouncy,
                             stiffness = Spring.StiffnessMediumLow
@@ -328,9 +337,27 @@ fun EntityBodyScreen(
                 }
 
                 AnimatedVisibility(
+                    visible = showTargetCard,
+                    enter = fadeIn(tween(240)) + slideInVertically(
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioLowBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        ),
+                        initialOffsetY = { it / 4 }
+                    )
+                ) {
+                    TargetAiAndShizukuCard(
+                        selectedPackage = uiState.targetAiPackage,
+                        shizukuStatus = uiState.shizukuStatus,
+                        onSelectPackage = { pkg -> viewModel.selectTargetAiApp(context, pkg) },
+                        onRequestShizuku = viewModel::requestShizukuAuthorization
+                    )
+                }
+
+                AnimatedVisibility(
                     visible = showLogsCard,
                     modifier = Modifier.weight(1f),
-                    enter = fadeIn(tween(280)) + slideInVertically(
+                    enter = fadeIn(tween(260)) + slideInVertically(
                         animationSpec = spring(
                             dampingRatio = Spring.DampingRatioLowBouncy,
                             stiffness = Spring.StiffnessMediumLow
@@ -352,14 +379,15 @@ fun EntityBodyScreen(
 @Composable
 private fun HeaderSection(
     connectionState: ConnectionState,
-    accessibilityEnabled: Boolean
+    accessibilityEnabled: Boolean,
+    shizukuStatus: ShizukuStatus
 ) {
     val gradients = LocalGradientPalette.current
     val brandGradient = Brush.linearGradient(
         colors = listOf(gradients.primaryStart, gradients.primaryEnd)
     )
 
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -367,9 +395,9 @@ private fun HeaderSection(
         ) {
             Box(
                 modifier = Modifier
-                    .size(52.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .border(width = 1.5.dp, brush = brandGradient, shape = RoundedCornerShape(16.dp))
+                    .size(48.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .border(width = 1.5.dp, brush = brandGradient, shape = RoundedCornerShape(14.dp))
                     .padding(2.dp)
             ) {
                 Image(
@@ -377,20 +405,20 @@ private fun HeaderSection(
                     contentDescription = stringResource(R.string.cd_brand_icon),
                     modifier = Modifier
                         .fillMaxSize()
-                        .clip(RoundedCornerShape(14.dp))
+                        .clip(RoundedCornerShape(12.dp))
                 )
             }
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = stringResource(R.string.app_name),
-                    style = MaterialTheme.typography.headlineMedium,
+                    style = MaterialTheme.typography.titleLarge,
                     color = MaterialTheme.colorScheme.onBackground
                 )
                 Box(
                     modifier = Modifier
-                        .padding(top = 2.dp, bottom = 3.dp)
-                        .width(64.dp)
+                        .padding(top = 2.dp, bottom = 2.dp)
+                        .width(56.dp)
                         .height(3.dp)
                         .clip(CircleShape)
                         .background(brandGradient)
@@ -405,51 +433,38 @@ private fun HeaderSection(
 
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             val (wsLabel, wsColor, wsPulsing) = when (connectionState) {
-                ConnectionState.CONNECTED -> Triple(
-                    stringResource(R.string.status_connected),
-                    MaterialTheme.colorScheme.tertiary,
-                    true
-                )
-                ConnectionState.CONNECTING -> Triple(
-                    stringResource(R.string.status_connecting),
-                    gradients.primaryStart,
-                    true
-                )
-                ConnectionState.ERROR -> Triple(
-                    stringResource(R.string.status_error),
-                    MaterialTheme.colorScheme.error,
-                    false
-                )
-                ConnectionState.DISCONNECTED -> Triple(
-                    stringResource(R.string.status_disconnected),
-                    MaterialTheme.colorScheme.onSurfaceVariant,
-                    false
-                )
+                ConnectionState.CONNECTED -> Triple("WS: Live", MaterialTheme.colorScheme.tertiary, true)
+                ConnectionState.CONNECTING -> Triple("WS: Sync…", gradients.primaryStart, true)
+                ConnectionState.ERROR -> Triple("WS: Error", MaterialTheme.colorScheme.error, false)
+                ConnectionState.DISCONNECTED -> Triple("WS: Off", MaterialTheme.colorScheme.onSurfaceVariant, false)
             }
             StatusPill(
-                label = "WS: $wsLabel",
+                label = wsLabel,
                 dotColor = wsColor,
                 isPulsing = wsPulsing,
                 modifier = Modifier.weight(1f)
             )
 
-            val accLabel = if (accessibilityEnabled) {
-                stringResource(R.string.accessibility_active)
-            } else {
-                stringResource(R.string.accessibility_inactive)
-            }
-            val accColor = if (accessibilityEnabled) {
-                gradients.primaryStart
-            } else {
-                AmberWarn
+            StatusPill(
+                label = if (accessibilityEnabled) "Eyes: On" else "Eyes: Off",
+                dotColor = if (accessibilityEnabled) gradients.primaryStart else AmberWarn,
+                isPulsing = accessibilityEnabled,
+                modifier = Modifier.weight(1f)
+            )
+
+            val (shizukuLabel, shizukuColor, shizukuPulse) = when (shizukuStatus) {
+                ShizukuStatus.READY -> Triple("Shizuku: On", MaterialTheme.colorScheme.tertiary, true)
+                ShizukuStatus.BINDING -> Triple("Shizuku: Bind", gradients.primaryStart, true)
+                ShizukuStatus.NEEDS_PERMISSION -> Triple("Shizuku: Auth", AmberWarn, false)
+                ShizukuStatus.UNAVAILABLE -> Triple("Shizuku: Off", MaterialTheme.colorScheme.onSurfaceVariant, false)
             }
             StatusPill(
-                label = accLabel,
-                dotColor = accColor,
-                isPulsing = accessibilityEnabled,
+                label = shizukuLabel,
+                dotColor = shizukuColor,
+                isPulsing = shizukuPulse,
                 modifier = Modifier.weight(1f)
             )
         }
@@ -473,7 +488,7 @@ private fun StatusPill(
     val pulseTransition = rememberInfiniteTransition(label = "pill_pulse")
     val pulseScale by pulseTransition.animateFloat(
         initialValue = 1f,
-        targetValue = 2.1f,
+        targetValue = 2.0f,
         animationSpec = infiniteRepeatable(
             animation = tween(durationMillis = 1400, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Restart
@@ -504,18 +519,18 @@ private fun StatusPill(
         border = BorderStroke(1.dp, pillBorderBrush)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Box(
-                modifier = Modifier.size(12.dp),
+                modifier = Modifier.size(10.dp),
                 contentAlignment = Alignment.Center
             ) {
                 if (isPulsing) {
                     Box(
                         modifier = Modifier
-                            .size(8.dp)
+                            .size(7.dp)
                             .graphicsLayer {
                                 scaleX = pulseScale
                                 scaleY = pulseScale
@@ -527,7 +542,7 @@ private fun StatusPill(
                 }
                 Box(
                     modifier = Modifier
-                        .size(8.dp)
+                        .size(7.dp)
                         .clip(CircleShape)
                         .background(animatedDot)
                 )
@@ -589,8 +604,8 @@ private fun WebSocketControlCard(
         border = BorderStroke(1.dp, cardBorderBrush)
     ) {
         Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -600,7 +615,7 @@ private fun WebSocketControlCard(
                     imageVector = Icons.Filled.Bolt,
                     contentDescription = stringResource(R.string.cd_ws_status_icon),
                     tint = gradients.primaryStart,
-                    modifier = Modifier.size(20.dp)
+                    modifier = Modifier.size(18.dp)
                 )
                 Text(
                     text = stringResource(R.string.ws_section_title),
@@ -776,8 +791,8 @@ private fun AccessibilityControlCard(
         border = BorderStroke(1.dp, cardBorderBrush)
     ) {
         Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -792,7 +807,7 @@ private fun AccessibilityControlCard(
                         imageVector = Icons.Filled.AccessibilityNew,
                         contentDescription = stringResource(R.string.cd_accessibility_status_icon),
                         tint = if (accessibilityEnabled) gradients.primaryStart else AmberWarn,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                     Text(
                         text = stringResource(R.string.accessibility_section_title),
@@ -872,6 +887,109 @@ private fun AccessibilityControlCard(
 }
 
 @Composable
+private fun TargetAiAndShizukuCard(
+    selectedPackage: String,
+    shizukuStatus: ShizukuStatus,
+    onSelectPackage: (String) -> Unit,
+    onRequestShizuku: () -> Unit
+) {
+    val gradients = LocalGradientPalette.current
+    val cardBorderBrush = Brush.linearGradient(
+        colors = listOf(
+            gradients.primaryStart.copy(alpha = 0.28f),
+            gradients.primaryEnd.copy(alpha = 0.35f)
+        )
+    )
+    val outlineGradient = Brush.horizontalGradient(
+        colors = listOf(gradients.primaryStart, gradients.primaryEnd)
+    )
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, cardBorderBrush)
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.AutoAwesome,
+                        contentDescription = null,
+                        tint = gradients.primaryEnd,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = stringResource(R.string.target_ai_section_title),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+
+                if (shizukuStatus != ShizukuStatus.READY) {
+                    GradientActionButton(
+                        onClick = onRequestShizuku,
+                        brush = Brush.horizontalGradient(
+                            colors = listOf(
+                                gradients.primaryStart.copy(alpha = 0.20f),
+                                gradients.primaryEnd.copy(alpha = 0.24f)
+                            )
+                        ),
+                        contentColor = MaterialTheme.colorScheme.onSurface,
+                        border = BorderStroke(1.dp, outlineGradient),
+                        horizontalPadding = 10.dp,
+                        modifier = Modifier.testTag("grant_shizuku_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Shield,
+                            contentDescription = null,
+                            tint = gradients.primaryStart,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = stringResource(R.string.btn_grant_shizuku),
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                BridgeRepository.KNOWN_AI_APPS.forEach { preset ->
+                    val selected = selectedPackage == preset.packageName
+                    FilterChip(
+                        selected = selected,
+                        onClick = { onSelectPackage(preset.packageName) },
+                        label = { Text(preset.label) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                            selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        ),
+                        modifier = Modifier.testTag("target_chip_${preset.label.lowercase()}")
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun GradientActionButton(
     onClick: () -> Unit,
     brush: Brush,
@@ -911,10 +1029,9 @@ private fun GradientActionButton(
     ) {
         Box(
             modifier = Modifier
-                .fillMaxWidth()
                 .heightIn(min = 48.dp)
                 .background(brush = brush, shape = MaterialTheme.shapes.small)
-                .padding(horizontal = horizontalPadding, vertical = 12.dp),
+                .padding(horizontal = horizontalPadding, vertical = 10.dp),
             contentAlignment = Alignment.Center
         ) {
             Row(
@@ -950,8 +1067,8 @@ private fun TelemetryLogCard(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -966,7 +1083,7 @@ private fun TelemetryLogCard(
                         imageVector = Icons.Filled.Terminal,
                         contentDescription = null,
                         tint = gradients.primaryEnd,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                     Text(
                         text = stringResource(R.string.logs_section_title),
@@ -1019,7 +1136,7 @@ private fun TelemetryLogCard(
                             .fillMaxSize()
                             .clip(MaterialTheme.shapes.small)
                             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
-                            .padding(20.dp),
+                            .padding(18.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Column(
@@ -1030,7 +1147,7 @@ private fun TelemetryLogCard(
                                 imageVector = Icons.Outlined.Info,
                                 contentDescription = null,
                                 tint = gradients.primaryStart.copy(alpha = 0.8f),
-                                modifier = Modifier.size(28.dp)
+                                modifier = Modifier.size(26.dp)
                             )
                             Text(
                                 text = stringResource(R.string.logs_empty_title),

@@ -88,12 +88,31 @@ class EntityAccessibilityService : AccessibilityService() {
             "enviar",
             "stop",
             "stop generating",
+            "stop streaming",
             "copy",
+            "copy code",
             "regenerate",
+            "retry",
+            "read aloud",
+            "good response",
+            "bad response",
+            "like",
+            "dislike",
+            "share",
+            "edit",
             "new chat",
+            "chatgpt",
+            "claude",
+            "gemini",
+            "copilot",
             "message chatgpt",
             "ask anything",
-            "reply to claude"
+            "ask gemini",
+            "reply to claude",
+            "message copilot",
+            "memory updated",
+            "thinking",
+            "searching the web"
         )
     }
 
@@ -117,6 +136,8 @@ class EntityAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        BridgeRepository.loadPreferences(this)
+        ShizukuController.init(this)
         serviceScope?.cancel()
         serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         instance = this
@@ -185,7 +206,7 @@ class EntityAccessibilityService : AccessibilityService() {
             val pkg = safePackageName(root)
             if (pkg == packageName || pkg == "com.android.systemui") return@launch
 
-            // 1. Screen Scraping (The Eyes) - deduplicated
+            // 1. Deduplicated screen state update
             val visibleLines = extractAllVisibleTexts(root)
             if (visibleLines.isNotEmpty()) {
                 val combinedScreenText = visibleLines.joinToString("\n")
@@ -202,7 +223,7 @@ class EntityAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // 2. Auto-Reply / Curiosity Loop detection
+            // 2. Intelligent response completion check
             evaluateResponseReadyLoop(root, pkg)
         }
     }
@@ -232,23 +253,23 @@ class EntityAccessibilityService : AccessibilityService() {
                     return@launch
                 }
 
-                val latestMessage = extractLastAiMessageText(freshRoot)
-                if (!latestMessage.isNullOrBlank() &&
-                    latestMessage != lastInjectedPrompt &&
-                    latestMessage != lastReportedReadyMessage
+                val cleanMessage = extractCleanLastAiBubble(freshRoot)
+                if (!cleanMessage.isNullOrBlank() &&
+                    cleanMessage != lastInjectedPrompt &&
+                    cleanMessage != lastReportedReadyMessage
                 ) {
                     wasGenerating = false
                     awaitingResponse = false
-                    lastReportedReadyMessage = latestMessage
-                    BridgeRepository.setLastAiMessage(latestMessage)
+                    lastReportedReadyMessage = cleanMessage
+                    BridgeRepository.setLastAiMessage(cleanMessage)
 
-                    val preview = latestMessage.take(70) + if (latestMessage.length > 70) "…" else ""
-                    BridgeRepository.addLog(LogLevel.OK, "Auto-Reply ready: $preview")
+                    val preview = cleanMessage.take(70) + if (cleanMessage.length > 70) "…" else ""
+                    BridgeRepository.addLog(LogLevel.OK, "Response ready: $preview")
 
                     if (BridgeRepository.connectionState.value == ConnectionState.CONNECTED) {
                         BridgeRepository.emitOutgoingMessage(
                             BridgeProtocol.responseReadyJson(
-                                lastMessage = latestMessage,
+                                cleanMessage = cleanMessage,
                                 packageName = safePackageName(freshRoot).ifBlank { pkg }
                             )
                         )
@@ -256,6 +277,14 @@ class EntityAccessibilityService : AccessibilityService() {
                 }
             }
         }
+    }
+
+    private fun getCurrentActivePackage(): String {
+        val rootPkg = safePackageName(safeGetActiveRoot())
+        if (rootPkg.isNotBlank() && rootPkg != packageName && rootPkg != "com.android.systemui") {
+            return rootPkg
+        }
+        return BridgeRepository.foregroundPackage.value.orEmpty()
     }
 
     private fun safeGetActiveRoot(): AccessibilityNodeInfo? {
@@ -305,18 +334,64 @@ class EntityAccessibilityService : AccessibilityService() {
         }
     }
 
+    private suspend fun ensureTargetAiAppActive(): AccessibilityActionResult {
+        val currentPkg = getCurrentActivePackage()
+        if (currentPkg in BridgeRepository.KNOWN_AI_PACKAGES) {
+            return AccessibilityActionResult.Success("AI app active: $currentPkg", currentPkg)
+        }
+
+        val targetPkg = BridgeRepository.getTargetAiPackage(this)
+        BridgeRepository.addLog(
+            LogLevel.INFO,
+            "Active window '$currentPkg' is not an AI app; launching $targetPkg…"
+        )
+
+        val launchResult = ShizukuController.launchApp(this, targetPkg)
+        if (launchResult is AccessibilityActionResult.Error) {
+            return launchResult
+        }
+
+        // Wait up to 6 seconds for the AI app window and EditText composer to appear
+        repeat(24) {
+            delay(250L)
+            val pkgNow = getCurrentActivePackage()
+            val roots = safeGetCandidateRoots()
+            val editReady = findBestEditTextNode(roots, null) != null
+            if ((pkgNow == targetPkg || pkgNow in BridgeRepository.KNOWN_AI_PACKAGES) && editReady) {
+                delay(350L)
+                return AccessibilityActionResult.Success("Loaded AI app: $pkgNow", pkgNow)
+            }
+        }
+
+        val finalPkg = getCurrentActivePackage()
+        return if (finalPkg in BridgeRepository.KNOWN_AI_PACKAGES) {
+            AccessibilityActionResult.Success("Loaded AI app: $finalPkg", finalPkg)
+        } else {
+            AccessibilityActionResult.Error(
+                "Timed out waiting for target AI app '$targetPkg' to load (current='$finalPkg')"
+            )
+        }
+    }
+
     suspend fun typeAndSend(
         text: String,
         sendButtonText: String = "Send"
     ): AccessibilityActionResult {
+        // 1. App Auto-Detection & Selection
+        val ensureApp = ensureTargetAiAppActive()
+        if (ensureApp is AccessibilityActionResult.Error) {
+            return ensureApp
+        }
+
+        // 2. Inject text into EditText
         val typeResult = injectText(text)
         if (typeResult is AccessibilityActionResult.Error) {
             return typeResult
         }
 
-        // Allow the target app's UI to process the injected text and enable the Send button
         delay(300L)
 
+        // 3. Click Send button (or fallback to last clickable node in input area)
         val editBounds = findBestEditTextBounds()
         val clickResult = clickSendOrLastInputNode(
             preferredLabel = sendButtonText,
@@ -326,7 +401,7 @@ class EntityAccessibilityService : AccessibilityService() {
             return clickResult
         }
 
-        // Mark awaiting response and wait 2 seconds before reading the screen so AI starts generating
+        // 4. Mark awaiting response & wait 2 seconds before reading the screen
         lastInjectedPrompt = text.trim()
         awaitingResponse = true
         wasGenerating = false
@@ -365,7 +440,6 @@ class EntityAccessibilityService : AccessibilityService() {
 
         val pkg = safePackageName(targetNode).ifBlank { safePackageName(roots.firstOrNull()) }
 
-        // Attempt 1: Focus + ACTION_SET_TEXT directly
         try {
             targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         } catch (_: Exception) {
@@ -386,7 +460,6 @@ class EntityAccessibilityService : AccessibilityService() {
             )
         }
 
-        // Attempt 2: Click to activate composer, then retry ACTION_SET_TEXT
         try {
             targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
@@ -407,7 +480,6 @@ class EntityAccessibilityService : AccessibilityService() {
             )
         }
 
-        // Attempt 3: Clipboard + ACTION_PASTE fallback for custom WebViews/composers
         val pasted = try {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
             clipboard?.setPrimaryClip(ClipData.newPlainText("entity_body_input", text))
@@ -482,8 +554,9 @@ class EntityAccessibilityService : AccessibilityService() {
 
     fun clickElement(text: String?, viewId: String? = null): AccessibilityActionResult {
         val roots = safeGetCandidateRoots()
-        val root = roots.firstOrNull()
-            ?: return AccessibilityActionResult.Error("No active window root available (rootInActiveWindow is null)")
+        if (roots.isEmpty()) {
+            return AccessibilityActionResult.Error("No active window root available (rootInActiveWindow is null)")
+        }
 
         if (!viewId.isNullOrBlank()) {
             for (r in roots) {
@@ -514,7 +587,6 @@ class EntityAccessibilityService : AccessibilityService() {
                 val pkg = safePackageName(r)
                 if (pkg == packageName || pkg == "com.android.systemui") continue
 
-                // 1. Standard findAccessibilityNodeInfosByText
                 for (candidate in candidates) {
                     val matched = try {
                         r.findAccessibilityNodeInfosByText(candidate)
@@ -541,7 +613,6 @@ class EntityAccessibilityService : AccessibilityService() {
                     }
                 }
 
-                // 2. Recursive exact match on text or contentDescription
                 val exactDescMatch = collectNodes(r) { node ->
                     node.isVisibleToUser && candidates.any { candidate ->
                         node.contentDescription?.toString()?.trim()?.equals(candidate, ignoreCase = true) == true ||
@@ -557,7 +628,6 @@ class EntityAccessibilityService : AccessibilityService() {
                     )
                 }
 
-                // 3. Recursive partial match on text or contentDescription
                 val partialDescMatch = collectNodes(r) { node ->
                     node.isVisibleToUser && candidates.any { candidate ->
                         node.contentDescription?.toString()?.contains(candidate, ignoreCase = true) == true ||
@@ -573,7 +643,6 @@ class EntityAccessibilityService : AccessibilityService() {
                     )
                 }
 
-                // 4. Common Send view IDs
                 if (isSendQuery) {
                     for (commonId in COMMON_SEND_VIEW_IDS) {
                         val byCommonId = try {
@@ -603,13 +672,11 @@ class EntityAccessibilityService : AccessibilityService() {
         preferredLabel: String,
         editBounds: Rect?
     ): AccessibilityActionResult {
-        // First try explicit Send text / Arabic / Spanish / contentDescription / common IDs
         val directResult = clickElement(text = preferredLabel)
         if (directResult is AccessibilityActionResult.Success) {
             return directResult
         }
 
-        // Fallback: click the last clickable enabled node in the input area
         val roots = safeGetCandidateRoots()
         for (root in roots) {
             val pkg = safePackageName(root)
@@ -626,7 +693,6 @@ class EntityAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // Try walking up 1..3 levels from EditText to inspect its input container
             if (editNode != null) {
                 var container: AccessibilityNodeInfo? = editNode.parent
                 var depth = 0
@@ -646,7 +712,6 @@ class EntityAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // Wider fallback: any clickable node sharing the EditText's horizontal band on screen
             if (resolvedEditBounds != null) {
                 val bandClickables = collectNodes(root) { node ->
                     if (!isCandidateInputAreaButton(node, editNode, resolvedEditBounds)) {
@@ -655,9 +720,8 @@ class EntityAccessibilityService : AccessibilityService() {
                     val r = Rect()
                     try {
                         node.getBoundsInScreen(r)
-                        val verticalOverlap = r.bottom >= (resolvedEditBounds.top - 120) &&
+                        r.bottom >= (resolvedEditBounds.top - 120) &&
                             r.top <= (resolvedEditBounds.bottom + 120)
-                        verticalOverlap
                     } catch (_: Exception) {
                         false
                     }
@@ -692,7 +756,6 @@ class EntityAccessibilityService : AccessibilityService() {
         val txt = node.text?.toString()?.trim()?.lowercase().orEmpty()
         if (desc in NON_SEND_DESCRIPTIONS || txt in NON_SEND_DESCRIPTIONS) return false
 
-        // If node wraps the EditText itself (parent container), exclude it
         if (editBounds != null) {
             val r = Rect()
             try {
@@ -711,12 +774,12 @@ class EntityAccessibilityService : AccessibilityService() {
             ?: return AccessibilityActionResult.Error("No active window root available (rootInActiveWindow is null)")
 
         val pkg = safePackageName(root)
-        val lastMessage = extractLastAiMessageText(root)
+        val lastMessage = extractCleanLastAiBubble(root)
         return if (!lastMessage.isNullOrBlank()) {
             BridgeRepository.setLastAiMessage(lastMessage)
             AccessibilityActionResult.Success(detail = lastMessage, packageName = pkg)
         } else {
-            AccessibilityActionResult.Error("No readable chat message blocks found on screen ($pkg)")
+            AccessibilityActionResult.Error("No clean AI message bubble found on screen ($pkg)")
         }
     }
 
@@ -856,7 +919,14 @@ class EntityAccessibilityService : AccessibilityService() {
         return collected
     }
 
-    private fun extractLastAiMessageText(root: AccessibilityNodeInfo): String? {
+    private fun extractCleanLastAiBubble(root: AccessibilityNodeInfo): String? {
+        val rootRect = Rect()
+        try {
+            root.getBoundsInScreen(rootRect)
+        } catch (_: Exception) {
+        }
+        val screenWidth = rootRect.width().coerceAtLeast(1)
+
         val inputTopY = collectNodes(root) { node ->
             node.isVisibleToUser &&
                 (node.className?.toString()?.contains("EditText", ignoreCase = true) == true || node.isEditable)
@@ -892,13 +962,14 @@ class EntityAccessibilityService : AccessibilityService() {
         }
 
         if (primaryChatContainer != null && primaryChatContainer.childCount > 0) {
-            val childMessages = mutableListOf<String>()
+            val aiBubbles = mutableListOf<String>()
             for (i in 0 until primaryChatContainer.childCount) {
                 val child = try {
                     primaryChatContainer.getChild(i)
                 } catch (_: Exception) {
                     null
                 } ?: continue
+
                 val childRect = Rect()
                 try {
                     child.getBoundsInScreen(childRect)
@@ -907,20 +978,42 @@ class EntityAccessibilityService : AccessibilityService() {
                     continue
                 }
 
-                val childTexts = extractMeaningfulTexts(child, inputTopY)
-                if (childTexts.isNotEmpty()) {
-                    childMessages.add(childTexts.joinToString("\n"))
+                val itemTexts = extractMeaningfulTexts(child, inputTopY)
+                if (itemTexts.isEmpty()) continue
+
+                val combinedBubble = itemTexts.joinToString("\n").trim()
+                if (isUserPromptBubble(combinedBubble, childRect, screenWidth)) {
+                    continue
                 }
+                aiBubbles.add(combinedBubble)
             }
 
-            val lastItemMessage = childMessages.lastOrNull { it.isNotBlank() }
-            if (!lastItemMessage.isNullOrBlank()) {
-                return lastItemMessage
+            val lastAiBubble = aiBubbles.lastOrNull { it.isNotBlank() }
+            if (!lastAiBubble.isNullOrBlank()) {
+                return lastAiBubble
             }
         }
 
-        val allTexts = extractMeaningfulTexts(root, inputTopY)
-        return allTexts.lastOrNull { it.isNotBlank() }
+        val fallbackTexts = extractMeaningfulTexts(root, inputTopY)
+            .filterNot { lastInjectedPrompt.isNotBlank() && it.equals(lastInjectedPrompt, ignoreCase = true) }
+        return fallbackTexts.lastOrNull { it.isNotBlank() }
+    }
+
+    private fun isUserPromptBubble(
+        bubbleText: String,
+        bubbleRect: Rect,
+        screenWidth: Int
+    ): Boolean {
+        if (lastInjectedPrompt.isNotBlank() &&
+            bubbleText.equals(lastInjectedPrompt, ignoreCase = true)
+        ) {
+            return true
+        }
+        // Heuristic: user message pills are typically compact and right-aligned in LTR chat UIs
+        val isCompactRightAligned = bubbleRect.left > (screenWidth * 0.30f) &&
+            bubbleRect.right > (screenWidth * 0.85f) &&
+            bubbleRect.width() < (screenWidth * 0.72f)
+        return isCompactRightAligned
     }
 
     private fun extractMeaningfulTexts(root: AccessibilityNodeInfo, maxBottomY: Int): List<String> {

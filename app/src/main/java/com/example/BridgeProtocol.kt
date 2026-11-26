@@ -3,10 +3,12 @@ package com.example
 import org.json.JSONObject
 
 sealed class BridgeCommand {
-    data class OpenApp(val packageName: String?, val appName: String?) : BridgeCommand()
+    data class LaunchApp(val packageName: String?, val appName: String?) : BridgeCommand()
+    data class SetTargetApp(val packageName: String) : BridgeCommand()
     data class TypeText(val text: String, val targetId: String? = null) : BridgeCommand()
     data class ClickElement(val text: String?, val viewId: String? = null) : BridgeCommand()
     data class TypeAndSend(val text: String, val sendButtonText: String = "Send") : BridgeCommand()
+    data class KeyEventCommand(val key: String) : BridgeCommand()
     data object ReadLastMessage : BridgeCommand()
     data object NavigateBack : BridgeCommand()
     data object NavigateHome : BridgeCommand()
@@ -26,14 +28,22 @@ object BridgeProtocol {
             }
 
             when (action) {
-                "open_app", "open", "launch" -> {
+                "launch_app", "open_app", "open", "launch" -> {
                     val pkg = json.optString("package", "").ifBlank {
                         json.optString("package_name", "")
                     }.ifBlank { null }
                     val app = json.optString("app", "").ifBlank {
                         json.optString("name", "")
                     }.ifBlank { null }
-                    BridgeCommand.OpenApp(packageName = pkg, appName = app)
+                    BridgeCommand.LaunchApp(packageName = pkg, appName = app)
+                }
+
+                "set_target_app" -> {
+                    val pkg = json.optString("package", "").trim()
+                    if (pkg.isEmpty()) {
+                        throw IllegalArgumentException("Missing 'package' field for 'set_target_app'")
+                    }
+                    BridgeCommand.SetTargetApp(packageName = pkg)
                 }
 
                 "type", "set_text", "input" -> {
@@ -65,6 +75,18 @@ object BridgeProtocol {
                     BridgeCommand.TypeAndSend(text = text, sendButtonText = sendText)
                 }
 
+                "key_event", "press_key", "keyevent", "key" -> {
+                    val key = json.optString("key", "").ifBlank {
+                        json.optString("keycode", "")
+                    }
+                    if (key.isBlank()) {
+                        throw IllegalArgumentException("Missing 'key' or 'keycode' for key_event")
+                    }
+                    BridgeCommand.KeyEventCommand(key = key)
+                }
+
+                "enter" -> BridgeCommand.KeyEventCommand(key = "enter")
+
                 "read", "read_last_message", "read_message", "get_response" -> {
                     BridgeCommand.ReadLastMessage
                 }
@@ -88,10 +110,10 @@ object BridgeProtocol {
         }.toString()
     }
 
-    fun responseReadyJson(lastMessage: String, packageName: String): String {
+    fun responseReadyJson(cleanMessage: String, packageName: String): String {
         return JSONObject().apply {
             put("action", "response_ready")
-            put("last_message", lastMessage)
+            put("message", cleanMessage)
             put("package", packageName)
             put("timestamp", System.currentTimeMillis())
         }.toString()
@@ -116,12 +138,20 @@ object BridgeProtocol {
         }.toString()
     }
 
-    fun statusJson(event: String, accessibilityEnabled: Boolean, activePackage: String?): String {
+    fun statusJson(
+        event: String,
+        accessibilityEnabled: Boolean,
+        shizukuReady: Boolean,
+        activePackage: String?,
+        targetAiPackage: String
+    ): String {
         return JSONObject().apply {
             put("type", "status")
             put("event", event)
             put("accessibility_enabled", accessibilityEnabled)
+            put("shizuku_ready", shizukuReady)
             put("active_package", activePackage ?: "")
+            put("target_ai_package", targetAiPackage)
             put("timestamp", System.currentTimeMillis())
         }.toString()
     }

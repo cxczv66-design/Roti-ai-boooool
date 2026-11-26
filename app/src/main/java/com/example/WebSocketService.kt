@@ -77,6 +77,8 @@ class WebSocketService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        BridgeRepository.loadPreferences(this)
+        ShizukuController.init(this)
         createNotificationChannel()
         startForegroundWithStatus("Initializing bridge…")
 
@@ -167,7 +169,9 @@ class WebSocketService : Service() {
                 val hello = BridgeProtocol.statusJson(
                     event = "connected",
                     accessibilityEnabled = EntityAccessibilityService.instance != null,
-                    activePackage = BridgeRepository.foregroundPackage.value
+                    shizukuReady = ShizukuController.hasPermission(),
+                    activePackage = BridgeRepository.foregroundPackage.value,
+                    targetAiPackage = BridgeRepository.getTargetAiPackage(this@WebSocketService)
                 )
                 webSocket.send(hello)
             }
@@ -280,15 +284,41 @@ class WebSocketService : Service() {
                     val pong = BridgeProtocol.statusJson(
                         event = "pong",
                         accessibilityEnabled = EntityAccessibilityService.instance != null,
-                        activePackage = BridgeRepository.foregroundPackage.value
+                        shizukuReady = ShizukuController.hasPermission(),
+                        activePackage = BridgeRepository.foregroundPackage.value,
+                        targetAiPackage = BridgeRepository.getTargetAiPackage(this@WebSocketService)
                     )
                     webSocket.send(pong)
                     BridgeRepository.addLog(LogLevel.OK, "Sent pong status")
                 }
 
-                is BridgeCommand.OpenApp -> {
-                    val result = openTargetApp(cmd.packageName, cmd.appName)
-                    sendActionResult(webSocket, "open_app", result)
+                is BridgeCommand.LaunchApp -> {
+                    val resolvedPkg = resolveTargetPackage(cmd.packageName, cmd.appName)
+                    val result = if (resolvedPkg == null) {
+                        AccessibilityActionResult.Error(
+                            "Could not resolve package for '${cmd.appName ?: cmd.packageName.orEmpty()}'"
+                        )
+                    } else {
+                        ShizukuController.launchApp(this@WebSocketService, resolvedPkg)
+                    }
+                    sendActionResult(webSocket, "launch_app", result)
+                }
+
+                is BridgeCommand.SetTargetApp -> {
+                    BridgeRepository.setTargetAiPackage(this@WebSocketService, cmd.packageName)
+                    sendActionResult(
+                        webSocket,
+                        "set_target_app",
+                        AccessibilityActionResult.Success(
+                            detail = "Target AI app set to ${cmd.packageName}",
+                            packageName = cmd.packageName
+                        )
+                    )
+                }
+
+                is BridgeCommand.KeyEventCommand -> {
+                    val result = ShizukuController.sendKeyEvent(cmd.key)
+                    sendActionResult(webSocket, "key_event", result)
                 }
 
                 is BridgeCommand.TypeText -> {
@@ -356,22 +386,12 @@ class WebSocketService : Service() {
                 }
 
                 is BridgeCommand.NavigateBack -> {
-                    val service = EntityAccessibilityService.instance
-                    if (service == null) {
-                        sendMissingServiceError(webSocket, "back")
-                        return@launch
-                    }
-                    val result = withContext(Dispatchers.Main) { service.performBack() }
+                    val result = ShizukuController.sendKeyEvent("back")
                     sendActionResult(webSocket, "back", result)
                 }
 
                 is BridgeCommand.NavigateHome -> {
-                    val service = EntityAccessibilityService.instance
-                    if (service == null) {
-                        sendMissingServiceError(webSocket, "home")
-                        return@launch
-                    }
-                    val result = withContext(Dispatchers.Main) { service.performHome() }
+                    val result = ShizukuController.sendKeyEvent("home")
                     sendActionResult(webSocket, "home", result)
                 }
 
@@ -394,31 +414,8 @@ class WebSocketService : Service() {
         }
     }
 
-    private fun openTargetApp(packageName: String?, appName: String?): AccessibilityActionResult {
-        val resolvedPackage = packageName?.takeIf { it.isNotBlank() }
-            ?: resolvePackageFromName(appName)
-            ?: return AccessibilityActionResult.Error(
-                "Could not resolve package for app '${appName.orEmpty()}'"
-            )
-
-        val launchIntent = packageManager.getLaunchIntentForPackage(resolvedPackage)
-            ?: return AccessibilityActionResult.Error(
-                "App '$resolvedPackage' is not installed or has no launch activity"
-            )
-
-        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-        return try {
-            startActivity(launchIntent)
-            AccessibilityActionResult.Success(
-                detail = "Launched $resolvedPackage",
-                packageName = resolvedPackage
-            )
-        } catch (e: Exception) {
-            AccessibilityActionResult.Error("Failed to launch $resolvedPackage: ${e.message}")
-        }
-    }
-
-    private fun resolvePackageFromName(appName: String?): String? {
+    private fun resolveTargetPackage(packageName: String?, appName: String?): String? {
+        if (!packageName.isNullOrBlank()) return packageName.trim()
         val query = appName?.trim()?.lowercase() ?: return null
         KNOWN_APP_PACKAGES[query]?.let { return it }
 
